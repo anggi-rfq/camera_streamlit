@@ -18,10 +18,10 @@ CANDIDATE_PATHS = [
 MODEL_DIR = "models"
 MODEL_FILE = os.path.join(MODEL_DIR, "models_camera.joblib")
 
-st.set_page_config(page_title="Camera Premium Predictor", layout="centered")
-st.title("Camera Premium Predictor")
-st.write("Aplikasi sederhana: prediksi apakah sebuah kamera termasuk **premium** berdasarkan spesifikasi.\
-         Jika model belum ada, aplikasi akan melatih model secara otomatis (menggunakan dataset yang tersedia).")
+st.set_page_config(page_title="Camera Premium Predictor (Pilih Model)", layout="centered")
+st.title("Camera Premium Predictor — Pilih Model")
+st.write("Pilih model untuk prediksi: Voting (ensemble), RandomForest, atau SVC. \
+Jika model belum ada, app akan melatih ketiganya (akan memakan waktu).")
 
 def find_dataset():
     for p in CANDIDATE_PATHS:
@@ -32,7 +32,7 @@ def find_dataset():
 def load_and_prepare(path):
     df = pd.read_csv(path)
     if 'Price' not in df.columns:
-        st.error("Kolom 'Price' tidak ditemukan pada dataset. Tidak bisa melanjutkan.")
+        st.error("Kolom 'Price' tidak ditemukan di dataset. Tidak bisa melanjutkan.")
         st.stop()
     df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
     q3 = df['Price'].quantile(0.75)
@@ -45,63 +45,108 @@ def load_and_prepare(path):
     y = df['is_premium']
     return df, X, y
 
-def train_bundle(X, y):
+def train_all(X, y, save_file=MODEL_FILE):
+    st.info("Melatih RandomForest, SVC, dan Voting (ensemble). Tunggu sebentar...")
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
+
     X_train, X_test, y_train, y_test = train_test_split(
         X_scaled, y, test_size=0.2, random_state=42, stratify=y
     )
+
     rf = RandomForestClassifier(n_estimators=300, random_state=42)
     svc = SVC(kernel='rbf', C=3, probability=True, random_state=42)
     voting = VotingClassifier([('rf', rf), ('svc', svc)], voting='soft')
+
+    rf.fit(X_train, y_train)
+    svc.fit(X_train, y_train)
     voting.fit(X_train, y_train)
-    # eval
-    y_pred = voting.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    rep = classification_report(y_test, y_pred)
-    cm = confusion_matrix(y_test, y_pred)
-    # bundle
-    bundle = {"model": voting, "scaler": scaler, "feature_names": list(X.columns), "eval": {"acc": acc, "report": rep, "cm": cm}}
+
+    results = {}
+    for name, model in [('RandomForest', rf), ('SVC', svc), ('Voting', voting)]:
+        y_pred = model.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        rep = classification_report(y_test, y_pred, output_dict=False)
+        cm = confusion_matrix(y_test, y_pred)
+        results[name] = {"accuracy": acc, "report": rep, "cm": cm}
+
     os.makedirs(MODEL_DIR, exist_ok=True)
-    joblib.dump(bundle, MODEL_FILE)
+    bundle = {
+        "rf": rf,
+        "svc": svc,
+        "voting": voting,
+        "scaler": scaler,
+        "feature_names": list(X.columns),
+        "eval": results
+    }
+    joblib.dump(bundle, save_file)
+    st.success(f"Pelatihan selesai dan model tersimpan di {save_file}")
+    return bundle
+
+def load_bundle(file=MODEL_FILE):
+    bundle = joblib.load(file)
+    if 'rf' not in bundle or 'svc' not in bundle:
+        if 'model' in bundle:
+            model = bundle['model']
+            try:
+                named = getattr(model, "named_estimators_", None)
+                if named and 'rf' in named and 'svc' in named:
+                    bundle['rf'] = named['rf']
+                    bundle['svc'] = named['svc']
+                    bundle['voting'] = model
+                else:
+                    ests = getattr(model, "estimators_", None)
+                    if ests and len(ests) >= 2:
+                        bundle['rf'] = ests[0]
+                        bundle['svc'] = ests[1]
+                        bundle['voting'] = model
+            except Exception:
+                pass
     return bundle
 
 dataset_path = find_dataset()
-if dataset_path is None:
-    st.warning("Dataset tidak ditemukan. Untuk menjalankan app ini Anda perlu upload file 'camera_dataset.csv' ke repo atau drive.")
-    st.info("Cek path yang dicari: " + ", ".join(CANDIDATE_PATHS))
-else:
+if dataset_path:
     st.write("Dataset ditemukan di:", dataset_path)
+else:
+    st.warning("Dataset tidak ditemukan. Upload file 'camera_dataset.csv' ke repo atau drive atau sesuaikan path.")
+    st.stop()
 
 if os.path.exists(MODEL_FILE):
-    st.success("Memuat model dari file.")
-    bundle = joblib.load(MODEL_FILE)
-    model = bundle.get("model")
-    scaler = bundle.get("scaler")
-    feature_names = bundle.get("feature_names")
+    bundle = load_bundle(MODEL_FILE)
+    st.success("Model ditemukan dan dimuat dari disk.")
 else:
-    st.info("Model belum ditemukan. Menyiapkan pelatihan (akan memakan waktu beberapa saat).")
-    if dataset_path is None:
-        st.stop()
     df, X, y = load_and_prepare(dataset_path)
-    bundle = train_bundle(X, y)
-    model = bundle["model"]
-    scaler = bundle["scaler"]
-    feature_names = bundle["feature_names"]
-    st.success("Pelatihan selesai dan model disimpan.")
+    bundle = train_all(X, y)
 
-if "eval" in bundle:
-    eval_info = bundle["eval"]
-    st.subheader("Evaluasi model (test set)")
-    st.write("Accuracy:", eval_info["acc"])
-    st.text("Classification report:\n" + str(eval_info["report"]))
-    st.text("Confusion matrix:\n" + str(eval_info["cm"]))
+rf = bundle.get("rf", None)
+svc = bundle.get("svc", None)
+voting = bundle.get("voting", None)
+scaler = bundle.get("scaler", None)
+feature_names = bundle.get("feature_names", None)
+evals = bundle.get("eval", None)
 
-st.subheader("Prediksi satu kamera (isi nilai numerik fitur)")
+if scaler is None:
+    st.error("Scaler tidak ditemukan dalam model bundle. Harap latih ulang menggunakan train script.")
+    st.stop()
+if feature_names is None:
+    st.error("Feature names tidak ditemukan dalam model bundle. Harap latih ulang menggunakan train script.")
+    st.stop()
 
-st.write("Masukkan nilai numerik untuk setiap fitur di bawah (urut sama seperti feature names). Jika tidak tahu, isi 0.")
-st.write("Urutan fitur (feature_names):")
+st.sidebar.header("Pilih Model untuk Prediksi")
+model_choice = st.sidebar.selectbox("Model", ("Voting (ensemble)", "RandomForest", "SVC"))
+
+if evals:
+    st.sidebar.subheader("Perbandingan Akurasi (test set)")
+    acc_table = {name: round(info["accuracy"], 4) for name, info in evals.items()}
+    st.sidebar.write(acc_table)
+else:
+    st.sidebar.info("Evaluasi tidak tersedia (bundle lama).")
+
+st.subheader("Informasi fitur yang dipakai (urutan)")
 st.write(feature_names)
+
+st.subheader("Prediksi 1 Kamera (masukkan nilai numerik untuk setiap fitur)")
+st.write("Jika tidak tahu, isi 0.")
 
 inputs = []
 cols = st.columns(2)
@@ -111,15 +156,27 @@ for i, fname in enumerate(feature_names):
     inputs.append(val)
 
 if st.button("Predict"):
+    model_map = {
+        "Voting (ensemble)": voting,
+        "RandomForest": rf,
+        "SVC": svc
+    }
+    chosen_model = model_map.get(model_choice)
+    if chosen_model is None:
+        st.error("Model yang dipilih tidak tersedia. Pastikan bundle berisi rf, svc, dan voting.")
+        st.stop()
+
     try:
         vals = [float(x) for x in inputs]
-    except:
-        st.error("Semua input harus angka (contoh: 12.0).")
+    except Exception:
+        st.error("Pastikan semua input berupa angka (contoh: 12.0).")
         st.stop()
+
     arr = np.array(vals).reshape(1, -1)
     arr_scaled = scaler.transform(arr)
-    pred = model.predict(arr_scaled)[0]
-    prob = model.predict_proba(arr_scaled)[0,1] if hasattr(model, "predict_proba") else None
+    pred = chosen_model.predict(arr_scaled)[0]
+    prob = chosen_model.predict_proba(arr_scaled)[0,1] if hasattr(chosen_model, "predict_proba") else None
+
     if pred == 1:
         st.success("Prediksi: PREMIUM")
     else:
@@ -127,5 +184,14 @@ if st.button("Predict"):
     if prob is not None:
         st.write(f"Probabilitas premium: {prob:.3f}")
 
+if st.checkbox("Tampilkan evaluasi lengkap (classification report & confusion matrix)"):
+    if evals:
+        for name, info in evals.items():
+            st.markdown(f"### {name}")
+            st.write("Accuracy:", info["accuracy"])
+            st.text("Classification report:\n" + str(info["report"]))
+            st.text("Confusion matrix:\n" + str(info["cm"]))
+    else:
+        st.info("Evaluasi tidak tersedia dalam model bundle.")
+
 st.markdown("---")
-st.write("Catatan: app ini memakai fitur numerik yang tersedia di dataset. Jika dataset punya banyak kolom teks/format berbeda, lakukan preprocessing (parsing) terlebih dahulu sebelum melatih model.")
